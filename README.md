@@ -48,3 +48,10 @@ Configure mock DynamoDB
 docker run -p 8000:8000 amazon/dynamodb-local
 ```
 
+Start frontend (if you have node installed)
+
+```bash
+cd pdf-frontend
+npm install
+npm run dev
+```
