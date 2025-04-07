@@ -1,0 +1,45 @@
+services:
+  minio:
+    image: quay.io/minio/minio
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9090:9090"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9090"
+    volumes:
+      - minio_data:/data
+  dynamodb:
+    image: amazon/dynamodb-local
+    container_name: dynamodb
+    ports:
+      - "8000:8000"
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pdf-backend
+    ports:
+      - "8080:8080"
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ./pdf_directory:/app/pdf_directory
+    depends_on:
+      - minio
+    restart: always
+  frontend:
+    build:
+      context: ./pdf-frontend
+    container_name: pdf-frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+volumes:
+  minio_data:
