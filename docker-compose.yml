@@ -11,6 +11,12 @@ services:
     command: server /data --console-address ":9090"
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/ready" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
   dynamodb:
     image: amazon/dynamodb-local
     container_name: dynamodb
@@ -31,7 +37,8 @@ services:
     volumes:
       - ./pdf_directory:/app/pdf_directory
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     restart: always
   frontend:
     build:

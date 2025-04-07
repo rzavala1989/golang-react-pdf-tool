@@ -2,35 +2,51 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"io"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"pdf-stuff/helpers"
 )
 
-// pdfDirectory is the directory where uploaded PDFs are stored.
-// bucketName is the name of the MinIO bucket where PDFs are stored.
 const (
 	pdfDirectory = "./pdf_directory"
 	bucketName   = "pdf-files"
 )
 
-// minioClient is the MinIO client instance.
 var minioClient *minio.Client
 
-// initMinio initializes the MinIO client and ensures the bucket exists. TODO: AWS S3 Integration goes here
+func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("⚠️  No .env file found, continuing without it")
+	} else {
+		log.Println("✅ Loaded .env file")
+	}
+
+	_ = os.MkdirAll(pdfDirectory, 0755)
+
+	initMinio()
+	initDynamo()
+
+	r := mux.NewRouter()
+	r.HandleFunc("/upload", uploadPDFHandler).Methods("POST")
+	r.HandleFunc("/download/{filename}", downloadPDFHandler).Methods("GET")
+
+	fmt.Println("Server started at http://localhost:8080")
+	if err := http.ListenAndServe(":8080", withCORS(r)); err != nil {
+		log.Fatalln("Error starting server:", err)
+	}
+}
+
+// initMinio initializes the MinIO client and ensures the bucket exists.
 func initMinio() {
-	endpoint := "minio:9000"
+	endpoint := "localhost:9000"
 	accessKeyID := "minioadmin"
 	secretAccessKey := "minioadmin"
 	useSSL := false
@@ -44,8 +60,6 @@ func initMinio() {
 		log.Fatalln("❌ MinIO init failed:", err)
 	}
 
-	// Ensure bucket exists
-	bucketName := "pdf-files"
 	ctx := context.Background()
 	exists, err := minioClient.BucketExists(ctx, bucketName)
 	if err != nil {
@@ -60,22 +74,13 @@ func initMinio() {
 	}
 }
 
-type FieldData struct {
-	Fields []Field `json:"fields"`
-}
-
-type Field struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-}
-
+// withCORS attaches CORS headers for dev
 func withCORS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-		// Handle preflight
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -85,28 +90,8 @@ func withCORS(h http.Handler) http.Handler {
 	})
 }
 
-func main() {
-	_ = os.MkdirAll(pdfDirectory, 0755)
-
-	initMinio()
-	initDynamo()
-	r := mux.NewRouter()
-
-	r.HandleFunc("/upload", UploadPDFHandler).Methods("POST")
-	r.HandleFunc("/fields/{filename}", ListFieldsHandler).Methods("GET")
-	r.HandleFunc("/fill/{filename}", FillFieldsHandler).Methods("POST")
-	r.HandleFunc("/download/{filename}", DownloadPDFHandler).Methods("GET")
-
-	fmt.Println("Server started at http://localhost:8080")
-	err := http.ListenAndServe(":8080", withCORS(r))
-	if err != nil {
-		fmt.Println("Error starting server:", err)
-		return
-	}
-}
-
-// UploadPDFHandler handles the PDF upload and saves it to both local storage and MinIO.
-func UploadPDFHandler(w http.ResponseWriter, r *http.Request) {
+// uploadPDFHandler → receives a multipart form-file named "pdf", saves locally, uploads to MinIO, then stores metadata in DynamoDB
+func uploadPDFHandler(w http.ResponseWriter, r *http.Request) {
 	file, header, err := r.FormFile("pdf")
 	if err != nil {
 		http.Error(w, "Error retrieving the file", http.StatusBadRequest)
@@ -118,122 +103,56 @@ func UploadPDFHandler(w http.ResponseWriter, r *http.Request) {
 	outputPath := filepath.Join(pdfDirectory, header.Filename)
 	out, err := os.Create(outputPath)
 	if err != nil {
-		http.Error(w, "Cannot save file", http.StatusInternalServerError)
+		http.Error(w, "Cannot create file on server", http.StatusInternalServerError)
 		return
 	}
 	defer out.Close()
-	_, err = io.Copy(out, file)
-	if err != nil {
-		http.Error(w, "Error saving", http.StatusInternalServerError)
+
+	if _, err = io.Copy(out, file); err != nil {
+		http.Error(w, "Error saving file", http.StatusInternalServerError)
 		return
 	}
 
 	// Upload to MinIO
-	localFile, _ := os.Open(outputPath)
-	defer localFile.Close()
-	stat, _ := localFile.Stat()
-	_, err = minioClient.PutObject(context.Background(), bucketName, header.Filename, localFile, stat.Size(), minio.PutObjectOptions{ContentType: "application/pdf"})
-	if err != nil {
+	if err := uploadToMinio(outputPath, header.Filename); err != nil {
 		http.Error(w, "Failed to upload to MinIO: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	log.Printf("⏫ Uploaded %s to bucket %s\n", header.Filename, bucketName)
 
-	fieldsMap, err := helpers.ExtractFormFields(outputPath)
-	if err == nil {
-		storePDFMeta(header.Filename, len(fieldsMap))
-	}
+	// Store metadata in DynamoDB (call your storePDFMeta function!)
+	storePDFMeta(header.Filename, 0)
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "Uploaded successfully")
 }
 
-// ListFieldsHandler lists the form fields in the specified PDF file.
-func ListFieldsHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	fileName := vars["filename"]
-	pdfPath := filepath.Join(pdfDirectory, fileName)
-
-	if _, err := os.Stat(pdfPath); os.IsNotExist(err) {
-		http.Error(w, "PDF not found", http.StatusNotFound)
-		return
-	}
-
-	fieldsMap, err := helpers.ExtractFormFields(pdfPath)
+// uploadToMinio is a helper function to store the file in MinIO
+func uploadToMinio(localPath, objectName string) error {
+	localFile, err := os.Open(localPath)
 	if err != nil {
-		http.Error(w, "Error extracting form fields: "+err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
+	defer localFile.Close()
 
-	var fields []Field
-	for name, value := range fieldsMap {
-		fields = append(fields, Field{
-			Name:  name,
-			Value: value,
-		})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(fields)
+	stat, err := localFile.Stat()
 	if err != nil {
-		http.Error(w, "Error encoding JSON: "+err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
+
+	_, err = minioClient.PutObject(
+		context.Background(),
+		bucketName,
+		objectName,
+		localFile,
+		stat.Size(),
+		minio.PutObjectOptions{ContentType: "application/pdf"},
+	)
+	return err
 }
 
-// FillFieldsHandler fills the form fields in the specified PDF file with the provided data.
-func FillFieldsHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	fileName := vars["filename"]
-	inPath := filepath.Join(pdfDirectory, fileName)
-
-	var fieldData FieldData
-	if err := json.NewDecoder(r.Body).Decode(&fieldData); err != nil {
-		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	ffMap := make(map[string]string)
-	for _, f := range fieldData.Fields {
-		ffMap[f.Name] = f.Value
-	}
-
-	fdfContent := helpers.GenerateFDF(ffMap)
-	tmpFDFPath := filepath.Join(pdfDirectory, "temp.fdf")
-	if err := os.WriteFile(tmpFDFPath, []byte(fdfContent), fs.ModePerm); err != nil {
-		http.Error(w, "Error writing temporary FDF file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	outPath := filepath.Join(pdfDirectory, "filled_"+fileName)
-	conf := model.NewDefaultConfiguration()
-
-	if err := api.FillFormFile(inPath, tmpFDFPath, outPath, conf); err != nil {
-		http.Error(w, "FillFormFile failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	flattenedPath := filepath.Join(pdfDirectory, "flattened_"+fileName)
-	if err := api.LockFormFieldsFile(outPath, flattenedPath, []string{}, conf); err != nil {
-		http.Error(w, "LockFormFieldsFile (flatten) failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	_ = os.Remove(tmpFDFPath)
-
-	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(map[string]string{
-		"message":   "Form filled and flattened",
-		"filledPDF": "filled_" + fileName,
-		"finalPDF":  "flattened_" + fileName,
-	})
-	if err != nil {
-		return
-	}
-}
-
-// DownloadPDFHandler serves the filled PDF file for download.
-func DownloadPDFHandler(w http.ResponseWriter, r *http.Request) {
+// downloadPDFHandler → returns the file to the client (if it exists on local disk)
+func downloadPDFHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	fileName := vars["filename"]
 	pdfPath := filepath.Join(pdfDirectory, fileName)

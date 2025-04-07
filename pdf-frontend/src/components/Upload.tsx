@@ -12,16 +12,25 @@ const Upload: React.FC<Props> = ({ onUploaded }) => {
         const formData = new FormData();
         formData.append('pdf', e.target.files[0]);
 
-        const res = await axios.post('http://localhost:8080/upload', formData);
-        if (res.status === 200) {
-            onUploaded(e.target.files[0].name);
+        try {
+            const res = await axios.post('http://localhost:8080/upload', formData);
+            if (res.status === 200) {
+                onUploaded(e.target.files[0].name);
+            }
+        } catch (error) {
+            console.error('Upload error:', error);
+            alert('Upload error. See console for details.');
         }
     };
 
     return (
         <div>
             <h2>Upload PDF</h2>
-            <input type="file" accept="application/pdf" onChange={handleUpload} />
+            <input
+                type="file"
+                accept="application/pdf"
+                onChange={handleUpload}
+            />
         </div>
     );
 };
